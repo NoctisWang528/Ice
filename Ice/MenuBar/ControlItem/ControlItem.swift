@@ -70,6 +70,8 @@ final class ControlItem {
             self.statusItem.autosaveName = controlItem.identifier.rawValue
 
             if let button = statusItem.button {
+                button.setAccessibilityIdentifier(controlItem.identifier.rawValue)
+
                 // This could break in a new macOS release, but we need this constraint in order to
                 // be able to hide the status item when the `ShowSectionDividers` setting is disabled.
                 // A previous implementation used `statusItem.isVisible`, which was more robust, but
@@ -78,7 +80,7 @@ final class ControlItem {
                 // status item to be present if its section is enabled. The new solution is to remove
                 // a constraint from the item's content view prevents it from having a length of zero.
                 // Then, we set the length. FIXME: Find a replacement for this.
-                var foundConstraint: NSLayoutConstraint? = nil
+                var foundConstraint: NSLayoutConstraint?
                 if
                     let window = button.window,
                     let contentView = window.contentView,

@@ -100,7 +100,11 @@ final class LayoutBarItemView: NSView {
     func provideAlertForDisabledItem() -> NSAlert {
         let alert = NSAlert()
         alert.messageText = "Menu bar item is not movable."
-        alert.informativeText = "macOS prohibits \"\(item.displayName)\" from being moved."
+        if item.hasRealWindowID {
+            alert.informativeText = "macOS prohibits \"\(item.displayName)\" from being moved."
+        } else {
+            alert.informativeText = "Moving Accessibility-only menu bar items is not yet supported on macOS 27."
+        }
         return alert
     }
 
@@ -113,12 +117,35 @@ final class LayoutBarItemView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if !isDraggingPlaceholder {
-            cachedImage?.nsImage.draw(
-                in: bounds,
-                from: .zero,
-                operation: .sourceOver,
-                fraction: isEnabled ? 1.0 : 0.67
-            )
+            if let cachedImage {
+                cachedImage.nsImage.draw(
+                    in: bounds,
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: isEnabled ? 1.0 : 0.67
+                )
+            } else if let fallbackImage = item.sourceApplication?.icon ?? NSImage(systemSymbolName: "menubar.rectangle", accessibilityDescription: nil) {
+                let maximumSize = CGSize(width: min(bounds.width, 22), height: min(bounds.height, 22))
+                let scale = min(
+                    maximumSize.width / fallbackImage.size.width,
+                    maximumSize.height / fallbackImage.size.height
+                )
+                let size = CGSize(
+                    width: fallbackImage.size.width * scale,
+                    height: fallbackImage.size.height * scale
+                )
+                fallbackImage.draw(
+                    in: CGRect(
+                        x: bounds.midX - size.width / 2,
+                        y: bounds.midY - size.height / 2,
+                        width: size.width,
+                        height: size.height
+                    ),
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: isEnabled ? 1.0 : 0.67
+                )
+            }
             if Bridging.isProcessUnresponsive(item.ownerPID) {
                 let warningImage = NSImage.warning
                 let width: CGFloat = 15

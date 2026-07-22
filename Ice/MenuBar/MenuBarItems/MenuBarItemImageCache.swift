@@ -117,6 +117,10 @@ final class MenuBarItemImageCache: ObservableObject {
         var boundsUnion = CGRect.null
 
         for item in items {
+            guard item.hasRealWindowID else {
+                result.excluded.append(item)
+                continue
+            }
             let windowID = item.windowID
 
             // Don't use `item.bounds`, it could be out of date.
@@ -172,6 +176,10 @@ final class MenuBarItemImageCache: ObservableObject {
         var result = CaptureResult()
 
         for item in items {
+            guard item.hasRealWindowID else {
+                result.excluded.append(item)
+                continue
+            }
             guard
                 let image = ScreenCapture.captureWindow(with: item.windowID, option: captureOption),
                 !image.isTransparent()
@@ -187,17 +195,24 @@ final class MenuBarItemImageCache: ObservableObject {
 
     /// Captures the images of the given menu bar items and returns the result.
     private nonisolated func captureImages(of items: [MenuBarItem], scale: CGFloat, appState: AppState) async -> CaptureResult {
+        let syntheticItems = items.filter { !$0.hasRealWindowID }
+        let captureItems = items.filter(\.hasRealWindowID)
+
         // Use individual capture after a move operation, since composite capture
         // doesn't account for overlapping items.
         if await appState.itemManager.lastMoveOperationOccurred(within: .seconds(2)) {
             logger.debug("Capturing individually due to recent item movement")
-            return individualCapture(items, scale: scale)
+            var result = individualCapture(captureItems, scale: scale)
+            result.excluded.append(contentsOf: syntheticItems)
+            return result
         }
 
-        let compositeResult = compositeCapture(items, scale: scale)
+        let compositeResult = compositeCapture(captureItems, scale: scale)
 
         if compositeResult.excluded.isEmpty {
-            return compositeResult // All items captured successfully.
+            var result = compositeResult
+            result.excluded.append(contentsOf: syntheticItems)
+            return result // All real windows captured successfully.
         }
 
         logger.notice(
@@ -212,6 +227,7 @@ final class MenuBarItemImageCache: ObservableObject {
         // Merge the successfully captured images from each result. Keep excluded
         // items as part of the result, so they can be logged elsewhere.
         individualResult.images.merge(compositeResult.images) { (_, new) in new }
+        individualResult.excluded.append(contentsOf: syntheticItems)
 
         return individualResult
     }
@@ -221,8 +237,15 @@ final class MenuBarItemImageCache: ObservableObject {
     private func captureImages(for section: MenuBarSection.Name, scale: CGFloat, appState: AppState) async -> [MenuBarItemTag: CapturedImage] {
         let items = await appState.itemManager.itemCache.managedItems(for: section)
         let captureResult = await captureImages(of: items, scale: scale, appState: appState)
-        if !captureResult.excluded.isEmpty {
-            logger.error("Some items failed capture: \(captureResult.excluded, privacy: .public)")
+        let syntheticCount = captureResult.excluded.lazy.filter { !$0.hasRealWindowID }.count
+        if syntheticCount > 0 {
+            logger.notice(
+                "Skipping thumbnail capture for \(syntheticCount, privacy: .public) Accessibility-only items"
+            )
+        }
+        let captureFailures = captureResult.excluded.filter(\.hasRealWindowID)
+        if !captureFailures.isEmpty {
+            logger.error("Some items failed thumbnail capture: \(captureFailures, privacy: .public)")
         }
         return captureResult.images
     }
@@ -332,6 +355,9 @@ final class MenuBarItemImageCache: ObservableObject {
         let items = appState?.itemManager.itemCache[section] ?? []
         guard !items.isEmpty else {
             return false
+        }
+        if items.contains(where: { !$0.hasRealWindowID }) {
+            return false // Accessibility-only items use application icon placeholders.
         }
         let keys = Set(images.keys)
         for item in items where keys.contains(item.tag) {

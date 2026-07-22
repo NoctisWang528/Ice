@@ -8,11 +8,37 @@ import Combine
 import OSLog
 import Semaphore
 
+/// The current state of menu bar item enumeration for user interfaces.
+enum MenuBarItemLoadState: Equatable {
+    case idle
+    case loading
+    case loaded
+    case loadedLimited(String)
+    case empty(String)
+    case permissionMissing
+    case failed(String)
+
+    var logString: String {
+        switch self {
+        case .idle: "idle"
+        case .loading: "loading"
+        case .loaded: "loaded"
+        case .loadedLimited: "loadedLimited"
+        case .empty: "empty"
+        case .permissionMissing: "permissionMissing"
+        case .failed: "failed"
+        }
+    }
+}
+
 /// Manager for menu bar items.
 @MainActor
 final class MenuBarItemManager: ObservableObject {
     /// The current cache of menu bar items.
     @Published private(set) var itemCache = ItemCache(displayID: nil)
+
+    /// The current state of menu bar item enumeration.
+    @Published private(set) var loadState = MenuBarItemLoadState.idle
 
     /// Logger for the menu bar item manager.
     private nonisolated let logger = Logger.menuBarItemManager
@@ -22,6 +48,9 @@ final class MenuBarItemManager: ObservableObject {
 
     /// Actor for managing menu bar item cache operations.
     private let cacheActor = CacheActor()
+
+    /// The operating-system-specific menu bar item provider.
+    private let itemProvider = MenuBarItemProvider.current()
 
     /// Contexts for temporarily shown menu bar items.
     private var temporarilyShownItemContexts = [TemporarilyShownItemContext]()
@@ -243,7 +272,7 @@ extension MenuBarItemManager {
         }
 
         func bestBounds(for item: MenuBarItem) -> CGRect {
-            Bridging.getWindowBounds(for: item.windowID) ?? item.bounds
+            item.currentBounds
         }
 
         func isValidForCaching(_ item: MenuBarItem) -> Bool {
@@ -288,9 +317,11 @@ extension MenuBarItemManager {
     private func uncheckedCacheItems(
         items: [MenuBarItem],
         controlItems: ControlItemPair,
-        displayID: CGDirectDisplayID?
-    ) async {
+        displayID: CGDirectDisplayID?,
+        fallbackUnclassifiedItemsToVisible: Bool = false
+    ) async -> Bool {
         var context = CacheContext(controlItems: controlItems, displayID: displayID)
+        var usedLimitedFallback = false
 
         for item in items where context.isValidForCaching(item) {
             if item.sourcePID == nil {
@@ -311,6 +342,12 @@ extension MenuBarItemManager {
                 continue
             }
 
+            if fallbackUnclassifiedItemsToVisible {
+                context.cache[.visible].append(item)
+                usedLimitedFallback = true
+                continue
+            }
+
             logger.warning("Couldn't find section for caching \(item.logString, privacy: .public)")
             context.shouldClearCachedItemWindowIDs = true
         }
@@ -326,11 +363,36 @@ extension MenuBarItemManager {
 
         guard itemCache != context.cache else {
             logger.debug("Not updating menu bar item cache, as items haven't changed")
-            return
+            return usedLimitedFallback
         }
 
         itemCache = context.cache
         logger.debug("Updated menu bar item cache")
+        return usedLimitedFallback
+    }
+
+    /// Caches Accessibility items when Ice's divider items cannot be found.
+    /// Existing in-memory section assignments are preserved when possible;
+    /// newly discovered items are placed in the Visible section.
+    private func cacheAccessibilityItemsWithoutDividers(
+        items: [MenuBarItem],
+        displayID: CGDirectDisplayID?
+    ) {
+        var cache = ItemCache(displayID: displayID)
+        for item in items {
+            guard
+                item.canBeHidden,
+                !item.isSystemClone,
+                !item.isControlItem || item.tag == .visibleControlItem
+            else {
+                continue
+            }
+            let previousSection = itemCache.address(for: item.tag)?.section
+            cache[previousSection ?? .visible].append(item)
+        }
+        if !cache.managedItems.isEmpty {
+            itemCache = cache
+        }
     }
 
     /// Caches the current menu bar items, regardless of whether the
@@ -351,21 +413,108 @@ extension MenuBarItemManager {
             }
 
             let displayID = Bridging.getActiveMenuBarDisplayID()
-            var items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            loadState = .loading
+            let snapshot = await itemProvider.menuBarItems(on: displayID, option: .activeSpace)
+            guard !Task.isCancelled else {
+                return
+            }
+
+            switch snapshot.outcome {
+            case .permissionMissing:
+                loadState = itemCache.managedItems.isEmpty ?
+                    .permissionMissing :
+                    .loadedLimited("Accessibility permission is missing. Showing the most recent menu bar item list.")
+                logger.error("Menu bar item enumeration requires Accessibility permission")
+                return
+            case .failed:
+                let message = snapshot.diagnosticMessage ?? "Menu bar item enumeration failed."
+                loadState = itemCache.managedItems.isEmpty ?
+                    .failed(message) :
+                    .loadedLimited("\(message) Showing the most recent menu bar item list.")
+                logger.error("Menu bar item enumeration failed: \(message, privacy: .public)")
+                return
+            case .empty:
+                let message = snapshot.diagnosticMessage ?? "No menu bar items were found."
+                loadState = itemCache.managedItems.isEmpty ?
+                    .empty(message) :
+                    .loadedLimited("\(message) Showing the most recent menu bar item list.")
+                logger.warning("Menu bar item enumeration returned no items: \(message, privacy: .public)")
+                return
+            case .loaded:
+                break
+            }
+
+            var items = snapshot.items
 
             let itemWindowIDs = currentItemWindowIDs ?? items.reversed().map { $0.windowID }
             await cacheActor.updateCachedItemWindowIDs(itemWindowIDs)
 
+            let foundVisibleControlItem = items.contains { $0.tag == .visibleControlItem }
+            let foundHiddenControlItem = items.contains { $0.tag == .hiddenControlItem }
+            let foundAlwaysHiddenControlItem = items.contains { $0.tag == .alwaysHiddenControlItem }
+            logger.info(
+                """
+                Control item discovery; visible=\(foundVisibleControlItem, privacy: .public), hidden=\(foundHiddenControlItem, privacy: .public), alwaysHidden=\(foundAlwaysHiddenControlItem, privacy: .public)
+                """
+            )
+
             guard let controlItems = ControlItemPair(items: &items) else {
-                // ???: Is clearing the cache the best thing to do here?
-                logger.warning("Missing control item for hidden section, clearing menu bar item cache")
-                itemCache = ItemCache(displayID: nil)
+                switch snapshot.source {
+                case .legacyWindowServer:
+                    logger.warning("Missing hidden control item in legacy snapshot; clearing menu bar item cache")
+                    itemCache = ItemCache(displayID: nil)
+                    loadState = .empty("Ice's hidden section divider could not be found.")
+                case .accessibility:
+                    logger.warning("Missing hidden control item in Accessibility snapshot; using limited Visible-section fallback")
+                    cacheAccessibilityItemsWithoutDividers(items: items, displayID: displayID)
+                    if itemCache.managedItems.isEmpty {
+                        loadState = .empty("Accessibility found menu bar items, but none could be displayed.")
+                    } else {
+                        loadState = .loadedLimited(
+                            "Ice's section dividers were not found. Detected items are shown in the Visible section."
+                        )
+                    }
+                }
+                logger.info(
+                    "Menu bar cache result; managedItems=\(itemCache.managedItems.count, privacy: .public), loadState=\(loadState.logString, privacy: .public)"
+                )
                 return
             }
 
-            await enforceControlItemOrder(controlItems: controlItems)
-            await uncheckedCacheItems(items: items, controlItems: controlItems, displayID: displayID)
+            switch snapshot.source {
+            case .legacyWindowServer:
+                await enforceControlItemOrder(controlItems: controlItems)
+                _ = await uncheckedCacheItems(
+                    items: items,
+                    controlItems: controlItems,
+                    displayID: displayID
+                )
+                loadState = itemCache.managedItems.isEmpty ?
+                    .empty("No manageable menu bar items were found.") :
+                    .loaded
+            case .accessibility:
+                let usedLimitedFallback = await uncheckedCacheItems(
+                    items: items,
+                    controlItems: controlItems,
+                    displayID: displayID,
+                    fallbackUnclassifiedItemsToVisible: true
+                )
+                let message = usedLimitedFallback ?
+                    "Some items could not be classified and are shown in the Visible section. Moving and hiding are not yet supported on macOS 27." :
+                    "Items are listed using Accessibility. Moving and hiding are not yet supported on macOS 27."
+                loadState = itemCache.managedItems.isEmpty ?
+                    .empty("Accessibility found no manageable menu bar items.") :
+                    .loadedLimited(message)
+            }
+            logger.info(
+                "Menu bar cache result; managedItems=\(itemCache.managedItems.count, privacy: .public), loadState=\(loadState.logString, privacy: .public)"
+            )
         }
+    }
+
+    /// Performs a complete menu bar item refresh.
+    func refreshMenuBarItems() async {
+        await cacheItemsRegardless()
     }
 
     /// Caches the current menu bar items, if the items have changed
@@ -375,9 +524,14 @@ extension MenuBarItemManager {
     /// the hidden and always-hidden sections are correctly ordered,
     /// arranging them into valid positions if needed.
     func cacheItemsIfNeeded() async {
-        let itemWindowIDs = Bridging.getMenuBarWindowList(option: [.itemsOnly, .activeSpace])
-        if await cacheActor.cachedItemWindowIDs != itemWindowIDs {
-            await cacheItemsRegardless(itemWindowIDs)
+        switch itemProvider.source {
+        case .legacyWindowServer:
+            let itemWindowIDs = Bridging.getMenuBarWindowList(option: [.itemsOnly, .activeSpace])
+            if await cacheActor.cachedItemWindowIDs != itemWindowIDs {
+                await cacheItemsRegardless(itemWindowIDs)
+            }
+        case .accessibility:
+            await cacheItemsRegardless()
         }
     }
 }
@@ -509,6 +663,9 @@ extension MenuBarItemManager {
 
     /// Returns the current bounds for the given item.
     private nonisolated func getCurrentBounds(for item: MenuBarItem) async throws -> CGRect {
+        guard item.hasRealWindowID else {
+            return item.bounds
+        }
         let task = Task.detached(priority: .userInitiated) {
             guard let bounds = Bridging.getWindowBounds(for: item.windowID) else {
                 throw EventError.missingItemBounds(item)
@@ -1074,7 +1231,7 @@ extension MenuBarItemManager {
     ///   - item: The menu bar item to move.
     ///   - destination: The destination to move the item to.
     func move(item: MenuBarItem, to destination: MoveDestination) async throws {
-        guard item.isMovable else {
+        guard item.isMovable, destination.targetItem.hasRealWindowID else {
             throw EventError.itemNotMovable(item)
         }
         guard let appState else {
@@ -1229,6 +1386,10 @@ extension MenuBarItemManager {
     ///   - item: The menu bar item to click.
     ///   - mouseButton: The mouse button to click the item with.
     func click(item: MenuBarItem, with mouseButton: CGMouseButton) async throws {
+        guard item.hasRealWindowID else {
+            logger.notice("Skipping click for Accessibility-only item: \(item.logString, privacy: .public)")
+            throw EventError.cannotComplete
+        }
         guard let appState else {
             throw EventError.cannotComplete
         }

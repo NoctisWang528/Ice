@@ -1,6 +1,6 @@
 //
 //  Bridging.swift
-//  Shared
+//  Ice
 //
 
 import Cocoa
@@ -412,33 +412,42 @@ extension Bridging {
     /// - Parameter option: Options that filter the returned list.
     ///   Pass an empty option set to return all available windows.
     static func getMenuBarWindowList(option: MenuBarWindowListOption = []) -> [CGWindowID] {
-        var predicates = [(CGWindowID) -> Bool]()
+        let rawList = getProcessMenuBarWindowList()
+        logger.info(
+            """
+            Menu bar WindowServer list; macOS=\(ProcessInfo.processInfo.operatingSystemVersionString, privacy: .public), rawCount=\(rawList.count, privacy: .public), rawWindowIDs=\(String(describing: rawList), privacy: .public)
+            """
+        )
+        var filteredList = rawList
 
         if option.contains(.onScreen) {
             let onScreenList = Set(getOnScreenWindowList())
-            predicates.append { windowID in
+            filteredList = filteredList.filter { windowID in
                 onScreenList.contains(windowID)
             }
         }
 
         if option.contains(.activeSpace) {
             let activeSpaceID = getActiveSpaceID()
-            predicates.append { windowID in
+            filteredList = filteredList.filter { windowID in
                 isWindowOnSpace(windowID, activeSpaceID)
             }
         }
 
         if option.contains(.itemsOnly) {
-            predicates.append { windowID in
+            let countBeforeItemsOnly = filteredList.count
+            filteredList = filteredList.filter { windowID in
                 getWindowLevel(for: windowID) != kCGMainMenuWindowLevel
             }
+            logger.info(
+                """
+                Menu bar .itemsOnly filter; before=\(countBeforeItemsOnly, privacy: .public), after=\(filteredList.count, privacy: .public)
+                """
+            )
         }
 
-        return getProcessMenuBarWindowList().filter { windowID in
-            predicates.allSatisfy { predicate in
-                predicate(windowID)
-            }
-        }
+        logger.info("Menu bar WindowServer filtered count=\(filteredList.count, privacy: .public)")
+        return filteredList
     }
 
     // MARK: - CGWindowList Helpers

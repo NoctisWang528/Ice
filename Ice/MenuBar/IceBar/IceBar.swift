@@ -142,12 +142,12 @@ final class IceBarPanel: NSPanel {
                 guard
                     lowerBound <= upperBound,
                     let controlItem = appState.itemManager.itemCache.managedItems.first(matching: .visibleControlItem),
-                    // Bridging API is more reliable than controlItem.frame in some
-                    // cases (like if the item is offscreen).
-                    let itemBounds = Bridging.getWindowBounds(for: controlItem.windowID)
+                    !controlItem.currentBounds.isEmpty
                 else {
                     return originForRightOfScreen
                 }
+
+                let itemBounds = controlItem.currentBounds
 
                 return CGPoint(x: (itemBounds.midX - frame.width / 2).clamped(to: lowerBound...upperBound), y: originY)
             }
@@ -413,7 +413,7 @@ private struct IceBarItemView: View {
             menuBarManager.section(withName: section)?.hide()
             Task {
                 try await Task.sleep(for: .milliseconds(25))
-                if Bridging.isWindowOnScreen(item.windowID) {
+                if item.isCurrentlyOnScreen {
                     try await itemManager.click(item: item, with: .left)
                 } else {
                     await itemManager.temporarilyShow(item: item, clickingWith: .left)
@@ -430,7 +430,7 @@ private struct IceBarItemView: View {
             menuBarManager.section(withName: section)?.hide()
             Task {
                 try await Task.sleep(for: .milliseconds(25))
-                if Bridging.isWindowOnScreen(item.windowID) {
+                if item.isCurrentlyOnScreen {
                     try await itemManager.click(item: item, with: .right)
                 } else {
                     await itemManager.temporarilyShow(item: item, clickingWith: .right)

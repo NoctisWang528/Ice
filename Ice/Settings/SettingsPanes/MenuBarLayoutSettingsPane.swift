@@ -30,9 +30,9 @@ struct MenuBarLayoutSettingsPane: View {
     private var header: some View {
         IceSection {
             VStack(spacing: 3) {
-                Text("Drag to arrange your menu bar items into different sections.")
+                Text(headerTitle)
                     .font(.title3.bold())
-                Text("Items can also be arranged by ⌘ Command + dragging them in the menu bar.")
+                Text(headerSubtitle)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
             }
@@ -42,19 +42,33 @@ struct MenuBarLayoutSettingsPane: View {
 
     @ViewBuilder
     private var layoutBars: some View {
-        VStack(spacing: 20) {
-            ForEach(MenuBarSection.Name.allCases, id: \.self) { section in
-                layoutBar(for: section)
+        if hasItems {
+            VStack(spacing: 14) {
+                loadStateNotice
+
+                VStack(spacing: 20) {
+                    ForEach(MenuBarSection.Name.allCases, id: \.self) { section in
+                        layoutBar(for: section)
+                    }
+                }
             }
+        } else {
+            loadStatePlaceholder
         }
-        .opacity(hasItems ? 1 : 0.75)
-        .blur(radius: hasItems ? 0 : 5)
-        .allowsHitTesting(hasItems)
-        .overlay {
-            if !hasItems {
-                loadingMenuBarItems
-            }
+    }
+
+    private var headerTitle: String {
+        if case .loadedLimited = itemManager.loadState {
+            return "Detected menu bar items"
         }
+        return "Drag to arrange your menu bar items into different sections."
+    }
+
+    private var headerSubtitle: String {
+        if case .loadedLimited = itemManager.loadState {
+            return "macOS 27 Accessibility enumeration is active. Moving and hiding are not yet supported."
+        }
+        return "Items can also be arranged by ⌘ Command + dragging them in the menu bar."
     }
 
     @ViewBuilder
@@ -80,12 +94,93 @@ struct MenuBarLayoutSettingsPane: View {
     }
 
     @ViewBuilder
-    private var loadingMenuBarItems: some View {
-        VStack {
-            Text("Loading menu bar items…")
-            ProgressView()
+    private var loadStateNotice: some View {
+        switch itemManager.loadState {
+        case .loading:
+            HStack {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Refreshing menu bar items…")
+                Spacer()
+            }
+            .foregroundStyle(.secondary)
+        case .loadedLimited(let message):
+            HStack(alignment: .firstTextBaseline) {
+                Image(systemName: "info.circle")
+                Text(message)
+                Spacer()
+                refreshButton
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        default:
+            EmptyView()
         }
-        .font(.title)
+    }
+
+    @ViewBuilder
+    private var loadStatePlaceholder: some View {
+        switch itemManager.loadState {
+        case .loading:
+            VStack(spacing: 10) {
+                Text("Loading menu bar items…")
+                ProgressView()
+            }
+            .font(.title3)
+            .frame(maxWidth: .infinity, minHeight: 220)
+        case .permissionMissing:
+            messagePlaceholder(
+                title: "Accessibility permission is required",
+                message: "Grant Accessibility permission in Advanced Settings, then refresh the menu bar item list.",
+                showsAdvancedSettingsButton: true
+            )
+        case .empty(let message):
+            messagePlaceholder(title: "No menu bar items found", message: message)
+        case .failed(let message):
+            messagePlaceholder(title: "Unable to load menu bar items", message: message)
+        case .idle:
+            messagePlaceholder(
+                title: "Menu bar items have not been loaded",
+                message: "Refresh to enumerate the current menu bar items."
+            )
+        case .loaded, .loadedLimited:
+            messagePlaceholder(
+                title: "No menu bar items available",
+                message: "Refresh to enumerate the current menu bar items."
+            )
+        }
+    }
+
+    private var refreshButton: some View {
+        Button("Refresh Menu Bar Items") {
+            Task {
+                await itemManager.refreshMenuBarItems()
+            }
+        }
+        .disabled(itemManager.loadState == .loading)
+    }
+
+    private func messagePlaceholder(
+        title: String,
+        message: String,
+        showsAdvancedSettingsButton: Bool = false
+    ) -> some View {
+        VStack(spacing: 10) {
+            Text(title)
+                .font(.title3.bold())
+            Text(message)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            HStack {
+                if showsAdvancedSettingsButton {
+                    Button("Go to Advanced Settings") {
+                        appState.navigationState.settingsNavigationIdentifier = .advanced
+                    }
+                }
+                refreshButton
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 220)
     }
 
     @ViewBuilder

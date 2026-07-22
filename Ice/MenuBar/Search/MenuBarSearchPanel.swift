@@ -377,7 +377,7 @@ private struct MenuBarSearchContentView: View {
         closePanel()
         Task {
             try await Task.sleep(for: .milliseconds(25))
-            if Bridging.isWindowOnScreen(item.windowID) {
+            if item.isCurrentlyOnScreen {
                 try await itemManager.click(item: item, with: .left)
             } else {
                 await itemManager.temporarilyShow(item: item, clickingWith: .left)
@@ -415,7 +415,7 @@ private struct ShowItemButton: View {
     var body: some View {
         Button(action: action) {
             HStack {
-                Text("\(Bridging.isWindowOnScreen(item.windowID) ? "Click" : "Show") Item")
+                Text("\(item.isCurrentlyOnScreen ? "Click" : "Show") Item")
                     .padding(.leading, 5)
 
                 Image(systemName: "return")

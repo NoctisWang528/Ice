@@ -4,14 +4,67 @@
 //
 
 import Cocoa
+import OSLog
 
 /// A structural representation of a menu bar item.
 struct MenuBarItem: CustomStringConvertible {
+    /// A reference to the window associated with a menu bar item.
+    enum WindowReference: Hashable {
+        /// A real WindowServer window identifier.
+        case real(CGWindowID)
+
+        /// A deterministic identifier for an Accessibility-only item.
+        case synthetic(CGWindowID)
+
+        /// The underlying identifier.
+        var id: CGWindowID {
+            switch self {
+            case .real(let id), .synthetic(let id): id
+            }
+        }
+
+        /// A Boolean value indicating whether the identifier belongs to a
+        /// real WindowServer window.
+        var isReal: Bool {
+            if case .real = self {
+                return true
+            }
+            return false
+        }
+    }
+
     /// The tag associated with this item.
     let tag: MenuBarItemTag
 
+    /// The item's real or synthetic window reference.
+    let windowReference: WindowReference
+
     /// The item's window identifier.
-    let windowID: CGWindowID
+    var windowID: CGWindowID {
+        windowReference.id
+    }
+
+    /// A Boolean value indicating whether the item has a real WindowServer
+    /// window identifier.
+    var hasRealWindowID: Bool {
+        windowReference.isReal
+    }
+
+    /// The best currently available bounds for the item.
+    var currentBounds: CGRect {
+        guard hasRealWindowID else {
+            return bounds
+        }
+        return Bridging.getWindowBounds(for: windowID) ?? bounds
+    }
+
+    /// A Boolean value indicating whether the item is currently on screen.
+    var isCurrentlyOnScreen: Bool {
+        guard hasRealWindowID else {
+            return isOnScreen
+        }
+        return Bridging.isWindowOnScreen(windowID)
+    }
 
     /// The identifier of the process that owns the item.
     let ownerPID: pid_t
@@ -30,7 +83,7 @@ struct MenuBarItem: CustomStringConvertible {
 
     /// A Boolean value that indicates whether this item can be moved.
     var isMovable: Bool {
-        tag.isMovable
+        hasRealWindowID && tag.isMovable
     }
 
     /// A Boolean value that indicates whether this item can be hidden.
@@ -165,7 +218,7 @@ struct MenuBarItem: CustomStringConvertible {
     /// Only call it if you are certain the window is a valid menu bar item.
     private init(uncheckedItemWindow itemWindow: WindowInfo) {
         self.tag = MenuBarItemTag(uncheckedItemWindow: itemWindow)
-        self.windowID = itemWindow.windowID
+        self.windowReference = .real(itemWindow.windowID)
         self.ownerPID = itemWindow.ownerPID
         self.sourcePID = itemWindow.ownerPID
         self.bounds = itemWindow.bounds
@@ -181,12 +234,31 @@ struct MenuBarItem: CustomStringConvertible {
     @available(macOS 26.0, *)
     private init(uncheckedItemWindow itemWindow: WindowInfo, sourcePID: pid_t?) {
         self.tag = MenuBarItemTag(uncheckedItemWindow: itemWindow, sourcePID: sourcePID)
-        self.windowID = itemWindow.windowID
+        self.windowReference = .real(itemWindow.windowID)
         self.ownerPID = itemWindow.ownerPID
         self.sourcePID = sourcePID
         self.bounds = itemWindow.bounds
         self.title = itemWindow.title
         self.isOnScreen = itemWindow.isOnScreen
+    }
+
+    /// Creates an Accessibility-backed menu bar item.
+    init(
+        accessibilityTag tag: MenuBarItemTag,
+        syntheticWindowID: CGWindowID,
+        ownerPID: pid_t,
+        sourcePID: pid_t?,
+        bounds: CGRect,
+        title: String?,
+        isOnScreen: Bool
+    ) {
+        self.tag = tag
+        self.windowReference = .synthetic(syntheticWindowID)
+        self.ownerPID = ownerPID
+        self.sourcePID = sourcePID
+        self.bounds = bounds
+        self.title = title
+        self.isOnScreen = isOnScreen
     }
 }
 
@@ -228,7 +300,8 @@ extension MenuBarItem {
             bridgingOption.insert(.activeSpace)
         }
 
-        return Bridging.getMenuBarWindowList(option: bridgingOption)
+        let windowIDs = Bridging.getMenuBarWindowList(option: bridgingOption)
+        let windows: [WindowInfo] = windowIDs
             .reversed().compactMap { windowID in
                 guard
                     displayBoundsPredicate(windowID),
@@ -238,6 +311,12 @@ extension MenuBarItem {
                 }
                 return window
             }
+        Logger.menuBarItem.info(
+            """
+            Created menu bar window descriptions; requested=\(windowIDs.count, privacy: .public), succeeded=\(windows.count, privacy: .public)
+            """
+        )
+        return windows
     }
 
     /// Creates and returns a list of menu bar items using experimental
@@ -268,20 +347,31 @@ extension MenuBarItem {
     ///     items across all available displays.
     ///   - option: Options that filter the returned list. Pass an empty option set
     ///     to return all available menu bar items.
-    static func getMenuBarItems(on display: CGDirectDisplayID? = nil, option: ListOption) async -> [MenuBarItem] {
+    static func getLegacyMenuBarItems(on display: CGDirectDisplayID? = nil, option: ListOption) async -> [MenuBarItem] {
         if #available(macOS 26.0, *) {
             await getMenuBarItemsExperimental(on: display, option: option)
         } else {
             getMenuBarItemsLegacyMethod(on: display, option: option)
         }
     }
+
+    /// Creates and returns a list using the operating-system-specific backend.
+    static func getMenuBarItems(on display: CGDirectDisplayID? = nil, option: ListOption) async -> [MenuBarItem] {
+        await MenuBarItemProvider.current()
+            .menuBarItems(on: display, option: option)
+            .items
+    }
+}
+
+private extension Logger {
+    static let menuBarItem = Logger(category: "MenuBarItem")
 }
 
 // MARK: MenuBarItem: Equatable
 extension MenuBarItem: Equatable {
     static func == (lhs: MenuBarItem, rhs: MenuBarItem) -> Bool {
         lhs.tag == rhs.tag &&
-        lhs.windowID == rhs.windowID &&
+        lhs.windowReference == rhs.windowReference &&
         lhs.ownerPID == rhs.ownerPID &&
         lhs.sourcePID == rhs.sourcePID &&
         NSStringFromRect(lhs.bounds) == NSStringFromRect(rhs.bounds) &&
@@ -294,7 +384,7 @@ extension MenuBarItem: Equatable {
 extension MenuBarItem: Hashable {
     func hash(into hasher: inout Hasher) {
         hasher.combine(tag)
-        hasher.combine(windowID)
+        hasher.combine(windowReference)
         hasher.combine(ownerPID)
         hasher.combine(sourcePID)
         hasher.combine(NSStringFromRect(bounds))

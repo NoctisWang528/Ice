@@ -1,6 +1,6 @@
 //
 //  AXHelpers.swift
-//  Shared
+//  Ice
 //
 
 import AXSwift
@@ -34,8 +34,36 @@ enum AXHelpers {
         queue.sync { try? element.arrayAttribute(.children) } ?? []
     }
 
+    /// Returns an element's children when the attribute can be read.
+    ///
+    /// Unlike ``children(for:)``, this preserves the distinction between an
+    /// empty children array and an Accessibility read failure.
+    static func childrenIfAvailable(for element: UIElement) -> [UIElement]? {
+        queue.sync { try? element.arrayAttribute(.children) }
+    }
+
+    static func identifier(for element: UIElement) -> String? {
+        queue.sync { try? element.attribute(.identifier) }
+    }
+
+    static func description(for element: UIElement) -> String? {
+        queue.sync { try? element.attribute(.description) }
+    }
+
+    static func title(for element: UIElement) -> String? {
+        queue.sync { try? element.attribute(.title) }
+    }
+
+    static func pid(for element: UIElement) -> pid_t? {
+        queue.sync { try? element.pid() }
+    }
+
     static func isEnabled(_ element: UIElement) -> Bool {
         queue.sync { try? element.attribute(.enabled) } ?? false
+    }
+
+    static func enabledIfAvailable(for element: UIElement) -> Bool? {
+        queue.sync { try? element.attribute(.enabled) }
     }
 
     static func frame(for element: UIElement) -> CGRect? {
