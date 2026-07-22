@@ -1,3 +1,30 @@
+# macOS (Finder) 产物
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.Icon?
+
+# Xcode 产物与用户配置
 build/
+DerivedData/
+*.xcuserstate
 xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods(预留)
+Pods/
+
+# 其他
+*.swp
+*.swo
+*~
+.DS_Store?
