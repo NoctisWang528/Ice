@@ -68,6 +68,9 @@ class Permission: ObservableObject, Identifiable {
 
     /// Sets up the internal observers for the permission.
     private func configureCancellables() {
+        timerCancellable?.cancel()
+        timerCancellable = nil
+
         timerCancellable = Timer.publish(every: 1, on: .main, in: .default)
             .autoconnect()
             .merge(with: Just(.now))
@@ -75,8 +78,16 @@ class Permission: ObservableObject, Identifiable {
                 guard let self else {
                     return
                 }
-                hasPermission = check()
+                refreshPermission()
             }
+    }
+
+    /// Refreshes and returns the current permission result.
+    @discardableResult
+    func refreshPermission() -> Bool {
+        let result = check()
+        hasPermission = result
+        return result
     }
 
     /// Performs the request and opens the System Settings app to the appropriate pane.
@@ -94,6 +105,7 @@ class Permission: ObservableObject, Identifiable {
             return
         }
         return await withCheckedContinuation { continuation in
+            hasPermissionCancellable?.cancel()
             hasPermissionCancellable = $hasPermission.sink { [weak self] hasPermission in
                 guard let self else {
                     continuation.resume()
@@ -141,6 +153,31 @@ final class AccessibilityPermission: Permission {
 // MARK: - ScreenRecordingPermission
 
 final class ScreenRecordingPermission: Permission {
+    /// The detailed screen capture authorization state.
+    @Published private(set) var authorizationState = ScreenCaptureAuthorizationState.notDetermined
+
+    /// A Boolean value that indicates whether a permission request is running.
+    @Published private(set) var isRequesting = false
+
+    /// A Boolean value that indicates whether a request was made in this process.
+    ///
+    /// Public screen capture APIs cannot distinguish a first request from a
+    /// previous denial. This in-memory value only improves the distinction for
+    /// the lifetime of the current process and intentionally is not persisted.
+    private var hasRequestedPermission = false
+
+    /// The most recent result from `CGRequestScreenCaptureAccess`, when used.
+    private var lastRequestResult: Bool?
+
+    /// Observer that keeps the detailed state in sync with `hasPermission`.
+    private var permissionCancellable: AnyCancellable?
+
+    /// Observer that refreshes permission as soon as the app becomes active.
+    private var appDidBecomeActiveCancellable: AnyCancellable?
+
+    /// The current capture capability validation task.
+    private var validationTask: Task<Void, Never>?
+
     init() {
         super.init(
             title: "Screen Recording",
@@ -151,11 +188,119 @@ final class ScreenRecordingPermission: Permission {
             isRequired: false,
             settingsURL: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"),
             check: {
-                ScreenCapture.checkPermissions()
+                ScreenCapture.cachedCheckPermissions(reset: true)
             },
-            request: {
-                ScreenCapture.requestPermissions()
-            }
+            request: {}
         )
+
+        permissionCancellable = $hasPermission
+            .removeDuplicates()
+            .sink { [weak self] hasPermission in
+                self?.updateAuthorizationState(hasPermission: hasPermission)
+            }
+
+        appDidBecomeActiveCancellable = NotificationCenter.default
+            .publisher(for: NSApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleAppDidBecomeActive()
+            }
+
+        if hasPermission {
+            startCaptureValidation()
+        }
+    }
+
+    deinit {
+        validationTask?.cancel()
+    }
+
+    /// Performs a user-initiated screen capture permission request.
+    override func performRequest() {
+        guard !isRequesting else {
+            return
+        }
+
+        guard ScreenCapture.isAuthorizationAvailable else {
+            setAuthorizationState(.unavailable)
+            return
+        }
+
+        isRequesting = true
+        hasRequestedPermission = true
+
+        Task { [weak self] in
+            let request = await ScreenCapture.requestPermissions()
+            guard let self else {
+                return
+            }
+
+            lastRequestResult = request.requestResult
+            let hasPermission = refreshPermission()
+
+            if hasPermission {
+                setAuthorizationState(.granted)
+                startCaptureValidation()
+            } else if request.requestResult == true {
+                setAuthorizationState(.restartRequired)
+            } else {
+                setAuthorizationState(.denied)
+                ScreenCapture.openSystemSettings()
+            }
+
+            isRequesting = false
+        }
+    }
+
+    /// Refreshes permission immediately after the app returns to the foreground.
+    private func handleAppDidBecomeActive() {
+        let hasPermission = refreshPermission()
+        ScreenCapture.logPermissionResultWhenAppBecomesActive(hasPermission)
+        updateAuthorizationState(hasPermission: hasPermission)
+
+        if hasPermission {
+            startCaptureValidation()
+        }
+    }
+
+    /// Updates the detailed state from the primary permission result.
+    private func updateAuthorizationState(hasPermission: Bool) {
+        guard ScreenCapture.isAuthorizationAvailable else {
+            setAuthorizationState(.unavailable)
+            return
+        }
+
+        if hasPermission {
+            setAuthorizationState(.granted)
+        } else if lastRequestResult == true {
+            setAuthorizationState(.restartRequired)
+        } else if hasRequestedPermission {
+            setAuthorizationState(.denied)
+        } else {
+            setAuthorizationState(.notDetermined)
+        }
+    }
+
+    /// Performs a diagnostic ScreenCaptureKit query after TCC reports access.
+    private func startCaptureValidation() {
+        validationTask?.cancel()
+        validationTask = Task { [weak self] in
+            let succeeded = await ScreenCapture.validateCaptureAccess()
+            guard let self, !Task.isCancelled else {
+                return
+            }
+
+            if succeeded {
+                setAuthorizationState(.granted)
+            } else {
+                setAuthorizationState(.restartRequired)
+            }
+        }
+    }
+
+    /// Updates the authorization state and logs restart requirements.
+    private func setAuthorizationState(_ state: ScreenCaptureAuthorizationState) {
+        authorizationState = state
+        ScreenCapture.logRestartRequired(state == .restartRequired)
     }
 }

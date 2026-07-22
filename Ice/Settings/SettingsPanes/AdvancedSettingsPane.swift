@@ -145,7 +145,9 @@ struct AdvancedSettingsPane: View {
     private var allPermissions: some View {
         ForEach(appState.permissions.allPermissions) { permission in
             LabeledContent {
-                if permission.hasPermission {
+                if let screenRecordingPermission = permission as? ScreenRecordingPermission {
+                    screenRecordingPermissionControl(screenRecordingPermission)
+                } else if permission.hasPermission {
                     Label {
                         Text("Permission Granted")
                     } icon: {
@@ -160,7 +162,46 @@ struct AdvancedSettingsPane: View {
             } label: {
                 Text(permission.title)
             }
-            .frame(height: 22)
+            .frame(minHeight: 22)
+        }
+    }
+
+    @ViewBuilder
+    private func screenRecordingPermissionControl(_ permission: ScreenRecordingPermission) -> some View {
+        switch permission.authorizationState {
+        case .granted:
+            Label {
+                Text("Permission Granted")
+            } icon: {
+                Image(systemName: "checkmark.circle")
+                    .foregroundStyle(.green)
+            }
+        case .restartRequired:
+            VStack(alignment: .trailing, spacing: 6) {
+                Text("Screen Recording permission was changed. Quit and reopen Ice to apply it.")
+                    .foregroundStyle(.secondary)
+
+                Button("Quit Ice") {
+                    NSApp.terminate(nil)
+                }
+            }
+            .multilineTextAlignment(.trailing)
+        case .notDetermined, .denied:
+            Button {
+                permission.performRequest()
+            } label: {
+                if permission.isRequesting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text("Grant Permission")
+                }
+            }
+            .disabled(permission.isRequesting)
+        case .unavailable:
+            Button("Open System Settings") {
+                ScreenCapture.openSystemSettings()
+            }
         }
     }
 }

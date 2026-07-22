@@ -149,22 +149,26 @@ struct PermissionsView: View {
                     }
                 }
 
-                Button {
-                    permission.performRequest()
-                    Task {
-                        await permission.waitForPermission()
-                        appState.activate(withPolicy: .regular)
-                        appState.openWindow(.permissions)
+                if let screenRecordingPermission = permission as? ScreenRecordingPermission {
+                    screenRecordingPermissionControl(screenRecordingPermission)
+                } else {
+                    Button {
+                        permission.performRequest()
+                        Task {
+                            await permission.waitForPermission()
+                            appState.activate(withPolicy: .regular)
+                            appState.openWindow(.permissions)
+                        }
+                    } label: {
+                        if permission.hasPermission {
+                            Text("Permission Granted")
+                                .foregroundStyle(.green)
+                        } else {
+                            Text("Grant Permission")
+                        }
                     }
-                } label: {
-                    if permission.hasPermission {
-                        Text("Permission Granted")
-                            .foregroundStyle(.green)
-                    } else {
-                        Text("Grant Permission")
-                    }
+                    .allowsHitTesting(!permission.hasPermission)
                 }
-                .allowsHitTesting(!permission.hasPermission)
 
                 if !permission.isRequired {
                     CalloutBox("Ice can work in a limited mode without this permission.") {
@@ -175,6 +179,45 @@ struct PermissionsView: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func screenRecordingPermissionControl(_ permission: ScreenRecordingPermission) -> some View {
+        switch permission.authorizationState {
+        case .granted:
+            Text("Permission Granted")
+                .foregroundStyle(.green)
+        case .restartRequired:
+            VStack(spacing: 8) {
+                Text("Screen Recording permission was changed. Quit and reopen Ice to apply it.")
+                    .multilineTextAlignment(.center)
+
+                Button("Quit Ice") {
+                    NSApp.terminate(nil)
+                }
+            }
+        case .notDetermined, .denied:
+            Button {
+                permission.performRequest()
+            } label: {
+                if permission.isRequesting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text("Grant Permission")
+                }
+            }
+            .disabled(permission.isRequesting)
+        case .unavailable:
+            VStack(spacing: 8) {
+                Text("Screen Recording permission is unavailable.")
+                    .foregroundStyle(.secondary)
+
+                Button("Open System Settings") {
+                    ScreenCapture.openSystemSettings()
+                }
+            }
         }
     }
 }

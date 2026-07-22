@@ -38,6 +38,9 @@ final class AppPermissions: ObservableObject {
     /// Storage for internal observers.
     private var cancellable: AnyCancellable?
 
+    /// Observer that forwards detailed screen recording permission changes.
+    private var screenRecordingCancellable: AnyCancellable?
+
     /// The permissions required for full app functionality.
     var allPermissions: [Permission] {
         [accessibility, screenRecording]
@@ -55,6 +58,11 @@ final class AppPermissions: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.updatePermissionsState()
+            }
+        self.screenRecordingCancellable = screenRecording.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
             }
     }
 
