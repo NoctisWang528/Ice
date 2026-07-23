@@ -155,6 +155,10 @@ struct MenuBarLayoutSettingsPane: View {
         Button("Refresh Menu Bar Items") {
             Task {
                 await itemManager.refreshMenuBarItems()
+                await appState.imageCache.updateCacheWithoutChecks(
+                    sections: MenuBarSection.Name.allCases,
+                    force: true
+                )
             }
         }
         .disabled(itemManager.loadState == .loading)

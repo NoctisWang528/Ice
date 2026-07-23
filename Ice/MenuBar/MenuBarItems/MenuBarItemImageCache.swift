@@ -31,29 +31,35 @@ final class MenuBarItemImageCache: ObservableObject {
         }
     }
 
-    /// The result of an image capture operation.
-    private struct CaptureResult {
-        /// The successfully captured images.
-        var images = [MenuBarItemTag: CapturedImage]()
-
-        /// The menu bar items excluded from the capture.
-        var excluded = [MenuBarItem]()
+    /// Context associated with a cached image.
+    private struct CacheContext {
+        let displayID: CGDirectDisplayID
+        let scale: CGFloat
+        let appearance: String
+        let bounds: CGRect
+        let windowReference: MenuBarItem.WindowReference
     }
 
     /// The cached item images, keyed by their corresponding tags.
     @Published private(set) var images = [MenuBarItemTag: CapturedImage]()
 
+    /// Capture context for each cached image.
+    private var cacheContexts = [MenuBarItemTag: CacheContext]()
+
     /// Logger for the menu bar item image cache.
     private let logger = Logger(category: "MenuBarItemImageCache")
 
-    /// Queue to run cache operations.
-    private let queue = DispatchQueue(label: "MenuBarItemImageCache", qos: .background)
-
-    /// Image capture options.
-    private let captureOption: CGWindowImageOption = [.boundsIgnoreFraming, .bestResolution]
-
     /// The shared app state.
     private weak var appState: AppState?
+
+    /// The operating-system-specific thumbnail provider.
+    private var thumbnailProvider: (any MenuBarItemThumbnailProviding)?
+
+    /// A token used to prevent stale asynchronous captures from updating the cache.
+    private var captureGeneration = 0
+
+    /// The time the most recent capture began.
+    private var lastCaptureStart: ContinuousClock.Instant?
 
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
@@ -64,6 +70,7 @@ final class MenuBarItemImageCache: ObservableObject {
     @MainActor
     func performSetup(with appState: AppState) {
         self.appState = appState
+        self.thumbnailProvider = MenuBarItemThumbnailProviderFactory.makeProvider(appState: appState)
         configureCancellables()
     }
 
@@ -74,8 +81,8 @@ final class MenuBarItemImageCache: ObservableObject {
 
         if let appState {
             Publishers.Merge3(
-                // Update every 3 seconds at minimum.
-                Timer.publish(every: 3, on: .main, in: .default).autoconnect().replace(with: ()),
+                // Refresh dynamic glyphs at a low frequency while a consumer is visible.
+                Timer.publish(every: 15, on: .main, in: .default).autoconnect().replace(with: ()),
 
                 // Update when the active space or screen parameters change.
                 Publishers.Merge(
@@ -90,7 +97,7 @@ final class MenuBarItemImageCache: ObservableObject {
                     appState.itemManager.$itemCache.removeDuplicates().replace(with: ())
                 )
             )
-            .throttle(for: 0.5, scheduler: DispatchQueue.main, latest: false)
+            .debounce(for: 0.5, scheduler: DispatchQueue.main)
             .sink { [weak self] in
                 guard let self else {
                     return
@@ -105,190 +112,100 @@ final class MenuBarItemImageCache: ObservableObject {
         cancellables = c
     }
 
-    // MARK: Capturing Images
-
-    /// Captures a composite image of the given items, then crops out an image
-    /// for each item and returns the result.
-    private nonisolated func compositeCapture(_ items: [MenuBarItem], scale: CGFloat) -> CaptureResult {
-        var result = CaptureResult()
-
-        var windowIDs = [CGWindowID]()
-        var storage = [CGWindowID: (MenuBarItem, CGRect)]()
-        var boundsUnion = CGRect.null
-
-        for item in items {
-            guard item.hasRealWindowID else {
-                result.excluded.append(item)
-                continue
-            }
-            let windowID = item.windowID
-
-            // Don't use `item.bounds`, it could be out of date.
-            guard let bounds = Bridging.getWindowBounds(for: windowID) else {
-                result.excluded.append(item)
-                continue
-            }
-
-            windowIDs.append(windowID)
-            storage[windowID] = (item, bounds)
-            boundsUnion = boundsUnion.union(bounds)
-        }
-
-        guard
-            let compositeImage = ScreenCapture.captureWindows(with: windowIDs, option: captureOption),
-            CGFloat(compositeImage.width) == boundsUnion.width * scale, // Safety check.
-            !compositeImage.isTransparent()
-        else {
-            result.excluded = items // Exclude all items.
-            return result
-        }
-
-        // Crop out each item from the composite.
-        for windowID in windowIDs {
-            guard let (item, bounds) = storage[windowID] else {
-                continue
-            }
-
-            let cropRect = CGRect(
-                x: (bounds.origin.x - boundsUnion.origin.x) * scale,
-                y: (bounds.origin.y - boundsUnion.origin.y) * scale,
-                width: bounds.width * scale,
-                height: bounds.height * scale
-            )
-
-            guard
-                let image = compositeImage.cropping(to: cropRect),
-                !image.isTransparent()
-            else {
-                result.excluded.append(item)
-                continue
-            }
-
-            result.images[item.tag] = CapturedImage(cgImage: image, scale: scale)
-        }
-
-        return result
-    }
-
-    /// Captures an image of each of the given items individually, then
-    /// returns the result.
-    private nonisolated func individualCapture(_ items: [MenuBarItem], scale: CGFloat) -> CaptureResult {
-        var result = CaptureResult()
-
-        for item in items {
-            guard item.hasRealWindowID else {
-                result.excluded.append(item)
-                continue
-            }
-            guard
-                let image = ScreenCapture.captureWindow(with: item.windowID, option: captureOption),
-                !image.isTransparent()
-            else {
-                result.excluded.append(item)
-                continue
-            }
-            result.images[item.tag] = CapturedImage(cgImage: image, scale: scale)
-        }
-
-        return result
-    }
-
-    /// Captures the images of the given menu bar items and returns the result.
-    private nonisolated func captureImages(of items: [MenuBarItem], scale: CGFloat, appState: AppState) async -> CaptureResult {
-        let syntheticItems = items.filter { !$0.hasRealWindowID }
-        let captureItems = items.filter(\.hasRealWindowID)
-
-        // Use individual capture after a move operation, since composite capture
-        // doesn't account for overlapping items.
-        if await appState.itemManager.lastMoveOperationOccurred(within: .seconds(2)) {
-            logger.debug("Capturing individually due to recent item movement")
-            var result = individualCapture(captureItems, scale: scale)
-            result.excluded.append(contentsOf: syntheticItems)
-            return result
-        }
-
-        let compositeResult = compositeCapture(captureItems, scale: scale)
-
-        if compositeResult.excluded.isEmpty {
-            var result = compositeResult
-            result.excluded.append(contentsOf: syntheticItems)
-            return result // All real windows captured successfully.
-        }
-
-        logger.notice(
-            """
-            Some items were excluded from composite capture. Attempting to capture \
-            excluded items individually: \(compositeResult.excluded, privacy: .public)
-            """
-        )
-
-        var individualResult = individualCapture(compositeResult.excluded, scale: scale)
-
-        // Merge the successfully captured images from each result. Keep excluded
-        // items as part of the result, so they can be logged elsewhere.
-        individualResult.images.merge(compositeResult.images) { (_, new) in new }
-        individualResult.excluded.append(contentsOf: syntheticItems)
-
-        return individualResult
-    }
-
-    /// Captures the images of the menu bar items in the given section and returns
-    /// a dictionary containing the images, keyed by their menu bar item tags.
-    private func captureImages(for section: MenuBarSection.Name, scale: CGFloat, appState: AppState) async -> [MenuBarItemTag: CapturedImage] {
-        let items = await appState.itemManager.itemCache.managedItems(for: section)
-        let captureResult = await captureImages(of: items, scale: scale, appState: appState)
-        let syntheticCount = captureResult.excluded.lazy.filter { !$0.hasRealWindowID }.count
-        if syntheticCount > 0 {
-            logger.notice(
-                "Skipping thumbnail capture for \(syntheticCount, privacy: .public) Accessibility-only items"
-            )
-        }
-        let captureFailures = captureResult.excluded.filter(\.hasRealWindowID)
-        if !captureFailures.isEmpty {
-            logger.error("Some items failed thumbnail capture: \(captureFailures, privacy: .public)")
-        }
-        return captureResult.images
-    }
-
     // MARK: Update Cache
 
     /// Updates the cache for the given sections, without checking whether
     /// caching is necessary.
-    func updateCacheWithoutChecks(sections: [MenuBarSection.Name]) async {
+    func updateCacheWithoutChecks(
+        sections: [MenuBarSection.Name],
+        force: Bool = false
+    ) async {
         guard
             let appState,
-            await appState.hasPermission(.screenRecording)
+            await appState.hasPermission(.screenRecording),
+            let thumbnailProvider
         else {
             return
         }
 
         guard
-            let displayID = await appState.itemManager.itemCache.displayID,
-            let screen = NSScreen.screens.first(where: { $0.displayID == displayID })
+            let displayID = await appState.itemManager.itemCache.displayID
         else {
             return
         }
 
-        let scale = screen.backingScaleFactor
-        var newImages = [MenuBarItemTag: CapturedImage]()
-
-        for section in sections {
-            guard await !appState.itemManager.itemCache[section].isEmpty else {
-                continue
+        let shouldStart = await MainActor.run {
+            let now = ContinuousClock.now
+            if
+                !force,
+                let lastCaptureStart,
+                now - lastCaptureStart < .seconds(2)
+            {
+                return false
             }
-
-            let sectionImages = await captureImages(for: section, scale: scale, appState: appState)
-
-            guard !sectionImages.isEmpty else {
-                logger.warning("Failed item image cache for \(section.logString, privacy: .public)")
-                continue
-            }
-
-            newImages.merge(sectionImages) { (_, new) in new }
+            lastCaptureStart = now
+            captureGeneration += 1
+            return true
+        }
+        guard shouldStart else {
+            logger.debug("Skipping thumbnail refresh inside minimum capture interval")
+            return
         }
 
-        await MainActor.run { [newImages] in
-            images.merge(newImages) { (_, new) in new }
+        let generation = await MainActor.run { captureGeneration }
+        let sectionItems = await MainActor.run {
+            sections.map { section in
+                appState.itemManager.itemCache.managedItems(for: section)
+            }
+        }
+        let items = sectionItems.flatMap { $0 }
+        guard !items.isEmpty else {
+            return
+        }
+
+        var newImages = [MenuBarItemTag: CapturedImage]()
+        if thumbnailProvider.capturesSectionsIndividually {
+            for items in sectionItems where !items.isEmpty {
+                let sectionImages = await thumbnailProvider.captureImages(
+                    for: items,
+                    displayID: displayID
+                )
+                newImages.merge(sectionImages) { _, new in new }
+            }
+        } else {
+            newImages = await thumbnailProvider.captureImages(for: items, displayID: displayID)
+        }
+
+        await MainActor.run { [newImages, items] in
+            guard generation == captureGeneration else {
+                logger.debug(
+                    "Discarding stale thumbnail capture; generation=\(generation, privacy: .public), current=\(self.captureGeneration, privacy: .public)"
+                )
+                return
+            }
+
+            let requestedTags = Set(items.map(\.tag))
+            if #available(macOS 27.0, *) {
+                images = images.filter { !requestedTags.contains($0.key) }
+                cacheContexts = cacheContexts.filter { !requestedTags.contains($0.key) }
+            }
+            images.merge(newImages) { _, new in new }
+
+            let screenScale = NSScreen.screens.first(where: { $0.displayID == displayID })?.backingScaleFactor ?? 1
+            let appearance = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])?.rawValue ?? "unknown"
+            for item in items where newImages[item.tag] != nil {
+                cacheContexts[item.tag] = CacheContext(
+                    displayID: displayID,
+                    scale: newImages[item.tag]?.scale ?? screenScale,
+                    appearance: appearance,
+                    bounds: item.bounds,
+                    windowReference: item.windowReference
+                )
+            }
+
+            logger.info(
+                "Applied thumbnail capture; generation=\(generation, privacy: .public), requested=\(items.count, privacy: .public), captured=\(newImages.count, privacy: .public), fallback=\(items.count - newImages.count, privacy: .public)"
+            )
         }
     }
 
