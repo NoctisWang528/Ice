@@ -28,6 +28,9 @@ final class LayoutBarItemView: NSView {
     /// layout view.
     var oldContainerInfo: (container: LayoutBarContainer, index: Int)?
 
+    /// The section where the current dragging session began.
+    var dragSourceSection: MenuBarSection.Name?
+
     /// A Boolean value that indicates whether the item view is currently inside a container.
     var hasContainer = false
 
@@ -69,7 +72,7 @@ final class LayoutBarItemView: NSView {
         unregisterDraggedTypes()
 
         self.toolTip = item.displayName
-        self.isEnabled = item.isMovable
+        self.isEnabled = appState.itemManager.canMove(item: item)
 
         configureCancellables()
     }
@@ -91,6 +94,19 @@ final class LayoutBarItemView: NSView {
                     self.cachedImage = cachedImage
                 }
                 .store(in: &c)
+
+            Publishers.CombineLatest(
+                appState.itemManager.$itemCache,
+                appState.itemManager.$isApplyingMenuBarMove
+            )
+            .sink { [weak self, weak appState] _, isApplyingMove in
+                guard let self, let appState else {
+                    return
+                }
+                self.isEnabled = !isApplyingMove &&
+                appState.itemManager.canMove(item: self.item)
+            }
+            .store(in: &c)
         }
 
         cancellables = c
@@ -103,7 +119,7 @@ final class LayoutBarItemView: NSView {
         if item.hasRealWindowID {
             alert.informativeText = "macOS prohibits \"\(item.displayName)\" from being moved."
         } else {
-            alert.informativeText = "Moving Accessibility-only menu bar items is not yet supported on macOS 27."
+            alert.informativeText = "This item cannot yet be reordered safely on macOS 27."
         }
         return alert
     }
@@ -203,6 +219,7 @@ extension LayoutBarItemView: NSDraggingSource {
         // aren't arranged during a dragging session
         if let container = superview as? LayoutBarContainer {
             container.canSetArrangedViews = false
+            dragSourceSection = container.section
         }
 
         // prevent the dragging image from animating back to its original location
@@ -218,6 +235,7 @@ extension LayoutBarItemView: NSDraggingSource {
         defer {
             // always remove container info at the end of a session
             oldContainerInfo = nil
+            dragSourceSection = nil
         }
 
         // since the session's `animatesToStartingPositionsOnCancelOrFail` property was

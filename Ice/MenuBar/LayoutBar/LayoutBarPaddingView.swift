@@ -63,13 +63,17 @@ final class LayoutBarPaddingView: NSView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        defer {
-            DispatchQueue.main.async {
-                self.container.canSetArrangedViews = true
-            }
-        }
-
-        guard let draggingSource = sender.draggingSource as? LayoutBarItemView else {
+        guard
+            let appState = container.appState,
+            let draggingSource = sender.draggingSource as? LayoutBarItemView,
+            let sourceSection = draggingSource.dragSourceSection,
+            appState.itemManager.canMove(
+                item: draggingSource.item,
+                from: sourceSection,
+                to: container.section
+            )
+        else {
+            restoreLayoutFromCache()
             return false
         }
 
@@ -85,20 +89,57 @@ final class LayoutBarPaddingView: NSView {
                     case .alwaysHidden: items.first(matching: .alwaysHiddenControlItem)
                     }
                     if let targetItem {
-                        move(item: draggingSource.item, to: .leftOfItem(targetItem))
+                        guard appState.itemManager.canUseAsMoveTarget(
+                            item: targetItem,
+                            for: draggingSource.item,
+                            from: sourceSection,
+                            to: container.section
+                        ) else {
+                            restoreLayoutFromCache()
+                            return
+                        }
+                        move(
+                            item: draggingSource.item,
+                            to: .leftOfItem(targetItem)
+                        )
                     } else {
                         Logger.default.error("No target item for layout bar drag")
+                        restoreLayoutFromCache()
                     }
                 }
             } else if arrangedViews.indices.contains(index + 1) {
                 // we have a view to the right of the dragging source
                 let targetItem = arrangedViews[index + 1].item
+                guard appState.itemManager.canUseAsMoveTarget(
+                    item: targetItem,
+                    for: draggingSource.item,
+                    from: sourceSection,
+                    to: container.section
+                ) else {
+                    restoreLayoutFromCache()
+                    return false
+                }
                 move(item: draggingSource.item, to: .leftOfItem(targetItem))
             } else if arrangedViews.indices.contains(index - 1) {
                 // we have a view to the left of the dragging source
                 let targetItem = arrangedViews[index - 1].item
+                guard appState.itemManager.canUseAsMoveTarget(
+                    item: targetItem,
+                    for: draggingSource.item,
+                    from: sourceSection,
+                    to: container.section
+                ) else {
+                    restoreLayoutFromCache()
+                    return false
+                }
                 move(item: draggingSource.item, to: .rightOfItem(targetItem))
+            } else {
+                restoreLayoutFromCache()
+                return false
             }
+        } else {
+            restoreLayoutFromCache()
+            return false
         }
 
         return true
@@ -109,7 +150,10 @@ final class LayoutBarPaddingView: NSView {
             return
         }
         Task {
-            try await Task.sleep(for: .milliseconds(25))
+            try? await Task.sleep(for: .milliseconds(25))
+            defer {
+                restoreLayoutFromCache()
+            }
             do {
                 try await appState.itemManager.move(item: item, to: destination)
                 appState.itemManager.removeTemporarilyShownItemFromCache(with: item.tag)
@@ -119,5 +163,16 @@ final class LayoutBarPaddingView: NSView {
                 alert.runModal()
             }
         }
+    }
+
+    /// Replaces any optimistic drag order with the manager's last confirmed cache.
+    private func restoreLayoutFromCache() {
+        guard let appState = container.appState else {
+            return
+        }
+        container.canSetArrangedViews = true
+        container.setArrangedViews(
+            items: appState.itemManager.itemCache.managedItems(for: container.section)
+        )
     }
 }

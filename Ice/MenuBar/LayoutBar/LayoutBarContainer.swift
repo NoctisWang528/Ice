@@ -206,7 +206,18 @@ final class LayoutBarContainer: NSView {
     /// - Returns: A dragging operation.
     @discardableResult
     func updateArrangedViewsForDrag(with draggingInfo: NSDraggingInfo, phase: DraggingPhase) -> NSDragOperation {
-        guard let sourceView = draggingInfo.draggingSource as? LayoutBarItemView else {
+        guard
+            let appState,
+            let sourceView = draggingInfo.draggingSource as? LayoutBarItemView,
+            let sourceSection = sourceView.dragSourceSection ??
+                sourceView.oldContainerInfo?.container.section ??
+                (sourceView.superview as? LayoutBarContainer)?.section,
+            appState.itemManager.canMove(
+                item: sourceView.item,
+                from: sourceSection,
+                to: section
+            )
+        else {
             return []
         }
         switch phase {
@@ -230,7 +241,14 @@ final class LayoutBarContainer: NSView {
             }
             // updating normally relies on the presence of other arranged views,
             // but if the container is empty, it needs to be handled separately
-            guard !arrangedViews.filter({ $0.isEnabled }).isEmpty else {
+            guard !arrangedViews.filter({
+                appState.itemManager.canUseAsMoveTarget(
+                    item: $0.item,
+                    for: sourceView.item,
+                    from: sourceSection,
+                    to: section
+                )
+            }).isEmpty else {
                 arrangedViews.insert(sourceView, at: 0)
                 return .move
             }
@@ -239,8 +257,12 @@ final class LayoutBarContainer: NSView {
             guard
                 let destinationView = arrangedView(nearestTo: draggingLocation.x),
                 destinationView !== sourceView,
-                // don't rearrange if destination is disabled
-                destinationView.isEnabled,
+                appState.itemManager.canUseAsMoveTarget(
+                    item: destinationView.item,
+                    for: sourceView.item,
+                    from: sourceSection,
+                    to: section
+                ),
                 // don't rearrange if in the middle of an animation
                 destinationView.layer?.animationKeys() == nil,
                 let destinationIndex = arrangedViews.firstIndex(of: destinationView)

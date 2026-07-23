@@ -66,7 +66,7 @@ struct MenuBarLayoutSettingsPane: View {
 
     private var headerSubtitle: String {
         if case .loadedLimited = itemManager.loadState {
-            return "macOS 27 Accessibility enumeration is active. Moving and hiding are not yet supported."
+            return "macOS 27 Accessibility enumeration is active. Safe third-party Visible items can be reordered; hiding is not yet supported."
         }
         return "Items can also be arranged by ⌘ Command + dragging them in the menu bar."
     }

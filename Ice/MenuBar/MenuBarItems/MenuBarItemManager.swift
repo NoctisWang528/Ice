@@ -40,17 +40,23 @@ final class MenuBarItemManager: ObservableObject {
     /// The current state of menu bar item enumeration.
     @Published private(set) var loadState = MenuBarItemLoadState.idle
 
+    /// Whether a physical menu bar reorder is currently being applied.
+    @Published private(set) var isApplyingMenuBarMove = false
+
     /// Logger for the menu bar item manager.
     private nonisolated let logger = Logger.menuBarItemManager
 
     /// Semaphore to prevent overlapping event operations.
-    private nonisolated let eventSemaphore = AsyncSemaphore(value: 1)
+    nonisolated let eventSemaphore = AsyncSemaphore(value: 1)
 
     /// Actor for managing menu bar item cache operations.
     private let cacheActor = CacheActor()
 
     /// The operating-system-specific menu bar item provider.
-    private let itemProvider = MenuBarItemProvider.current()
+    let itemProvider = MenuBarItemProvider.current()
+
+    /// The operating-system-specific physical movement provider.
+    private(set) var movementProvider: (any MenuBarItemMovementProviding)?
 
     /// Contexts for temporarily shown menu bar items.
     private var temporarilyShownItemContexts = [TemporarilyShownItemContext]()
@@ -73,6 +79,7 @@ final class MenuBarItemManager: ObservableObject {
     /// Sets up the manager.
     func performSetup(with appState: AppState) async {
         self.appState = appState
+        self.movementProvider = MenuBarItemMovementProviderFactory.makeProvider(manager: self)
         await cacheItemsRegardless()
         configureCancellables(with: appState)
     }
@@ -116,6 +123,28 @@ final class MenuBarItemManager: ObservableObject {
             return false
         }
         return timestamp.duration(to: .now) <= duration
+    }
+
+    /// Updates the state exposed to the layout interface during a physical move.
+    func setApplyingMenuBarMove(_ isApplying: Bool) {
+        isApplyingMenuBarMove = isApplying
+    }
+
+    /// Records a physical move event for cache throttling and diagnostics.
+    func markMoveOperation() {
+        lastMoveOperationTimestamp = .now
+    }
+
+    /// Rebuilds the live order and glyphs after a synthetic move attempt.
+    func refreshAfterSyntheticMove() async {
+        await refreshMenuBarItems(bypassRecentMoveGuard: true)
+        guard let appState else {
+            return
+        }
+        await appState.imageCache.updateCacheWithoutChecks(
+            sections: [.visible],
+            force: true
+        )
     }
 }
 
@@ -401,13 +430,16 @@ extension MenuBarItemManager {
     /// Before caching, this method ensures that the control items for
     /// the hidden and always-hidden sections are correctly ordered,
     /// arranging them into valid positions if needed.
-    func cacheItemsRegardless(_ currentItemWindowIDs: [CGWindowID]? = nil) async {
+    func cacheItemsRegardless(
+        _ currentItemWindowIDs: [CGWindowID]? = nil,
+        bypassRecentMoveGuard: Bool = false
+    ) async {
         await cacheActor.runCacheTask { [weak self] in
             guard let self else {
                 return
             }
 
-            guard !lastMoveOperationOccurred(within: .seconds(1)) else {
+            guard bypassRecentMoveGuard || !lastMoveOperationOccurred(within: .seconds(1)) else {
                 logger.debug("Skipping menu bar item cache due to recent item movement")
                 return
             }
@@ -500,8 +532,8 @@ extension MenuBarItemManager {
                     fallbackUnclassifiedItemsToVisible: true
                 )
                 let message = usedLimitedFallback ?
-                    "Some items could not be classified and are shown in the Visible section. Moving and hiding are not yet supported on macOS 27." :
-                    "Items are listed using Accessibility. Moving and hiding are not yet supported on macOS 27."
+                    "Some items could not be classified and are shown in the Visible section. Safe third-party items can be reordered; hiding is not yet supported on macOS 27." :
+                    "Items are listed using Accessibility. Safe third-party items can be reordered; hiding is not yet supported on macOS 27."
                 loadState = itemCache.managedItems.isEmpty ?
                     .empty("Accessibility found no manageable menu bar items.") :
                     .loadedLimited(message)
@@ -513,8 +545,8 @@ extension MenuBarItemManager {
     }
 
     /// Performs a complete menu bar item refresh.
-    func refreshMenuBarItems() async {
-        await cacheItemsRegardless()
+    func refreshMenuBarItems(bypassRecentMoveGuard: Bool = false) async {
+        await cacheItemsRegardless(bypassRecentMoveGuard: bypassRecentMoveGuard)
     }
 
     /// Caches the current menu bar items, if the items have changed
@@ -557,6 +589,14 @@ extension MenuBarItemManager {
         case itemResponseTimeout(MenuBarItem)
         /// A menu bar item's bounds cannot be found.
         case missingItemBounds(MenuBarItem)
+        /// An Accessibility snapshot cannot safely identify an item.
+        case ambiguousItemIdentity(MenuBarItem)
+        /// The current Accessibility snapshot cannot be used for movement.
+        case invalidAccessibilitySnapshot(String)
+        /// A synthetic drag would use invalid or unsafe geometry.
+        case invalidMoveGeometry
+        /// The live Accessibility order did not reflect the requested move.
+        case moveVerificationFailed
 
         var description: String {
             switch self {
@@ -576,6 +616,14 @@ extension MenuBarItemManager {
                 "\(Self.self).itemResponseTimeout(item: \(item.tag))"
             case .missingItemBounds(let item):
                 "\(Self.self).missingItemBounds(item: \(item.tag))"
+            case .ambiguousItemIdentity(let item):
+                "\(Self.self).ambiguousItemIdentity(item: \(item.tag))"
+            case .invalidAccessibilitySnapshot(let message):
+                "\(Self.self).invalidAccessibilitySnapshot(\(message))"
+            case .invalidMoveGeometry:
+                "\(Self.self).invalidMoveGeometry"
+            case .moveVerificationFailed:
+                "\(Self.self).moveVerificationFailed"
             }
         }
 
@@ -597,6 +645,14 @@ extension MenuBarItemManager {
                 "\"\(item.displayName)\" took too long to respond"
             case .missingItemBounds(let item):
                 "Missing bounds rectangle for \"\(item.displayName)\""
+            case .ambiguousItemIdentity(let item):
+                "\"\(item.displayName)\" cannot be identified safely"
+            case .invalidAccessibilitySnapshot:
+                "The current menu bar layout could not be read"
+            case .invalidMoveGeometry:
+                "The menu bar item is not in a safe position for reordering"
+            case .moveVerificationFailed:
+                "macOS did not apply the requested menu bar item order"
             }
         }
 
@@ -619,7 +675,7 @@ extension MenuBarItemManager {
     }
 
     /// Waits asynchronously for the user to pause input.
-    private nonisolated func waitForUserToPauseInput() async throws {
+    nonisolated func waitForUserToPauseInput() async throws {
         let waitTask = Task {
             while true {
                 try Task.checkCancellation()
@@ -638,7 +694,7 @@ extension MenuBarItemManager {
 
     /// Waits between move operations for a dynamic amount of time,
     /// based on the timestamp of the last move operation.
-    private nonisolated func waitForMoveOperationBuffer() async throws {
+    nonisolated func waitForMoveOperationBuffer() async throws {
         if let timestamp = await lastMoveOperationTimestamp {
             let buffer = max(.milliseconds(25) - timestamp.duration(to: .now), .zero)
             logger.debug("Move operation buffer: \(buffer)")
@@ -1230,7 +1286,7 @@ extension MenuBarItemManager {
     /// - Parameters:
     ///   - item: The menu bar item to move.
     ///   - destination: The destination to move the item to.
-    func move(item: MenuBarItem, to destination: MoveDestination) async throws {
+    func moveLegacyWindowItem(item: MenuBarItem, to destination: MoveDestination) async throws {
         guard item.isMovable, destination.targetItem.hasRealWindowID else {
             throw EventError.itemNotMovable(item)
         }

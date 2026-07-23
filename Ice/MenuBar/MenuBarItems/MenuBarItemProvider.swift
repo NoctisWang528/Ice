@@ -14,7 +14,7 @@ struct MenuBarItemSnapshot {
         case accessibility
     }
 
-    enum Outcome {
+    enum Outcome: Equatable {
         case loaded
         case empty
         case permissionMissing
@@ -90,6 +90,7 @@ struct MacOS27AccessibilityMenuBarItemProvider: MenuBarItemProviding {
         let namespace: String
         let stableIdentity: String
         let displayTitle: String?
+        let publisherBundleIdentifier: String?
         let ownerPID: pid_t
         let sourcePID: pid_t?
         let frame: CGRect
@@ -189,9 +190,12 @@ struct MacOS27AccessibilityMenuBarItemProvider: MenuBarItemProviding {
                 _ = AXHelpers.role(for: child)
                 _ = AXHelpers.enabledIfAvailable(for: child)
 
-                let identifiers = [directIdentifier].compactMap { $0 } + nestedIdentifiers
-                let descriptions = [directDescription].compactMap { $0 } + nestedDescriptions
-                let titles = [directTitle].compactMap { $0 } + nestedTitles
+                let identifiers = ([directIdentifier].compactMap { $0 } + nestedIdentifiers)
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                let descriptions = ([directDescription].compactMap { $0 } + nestedDescriptions)
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                let titles = ([directTitle].compactMap { $0 } + nestedTitles)
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
                 if isOverflowPlaceholder(
                     identifiers: identifiers,
@@ -251,7 +255,7 @@ struct MacOS27AccessibilityMenuBarItemProvider: MenuBarItemProviding {
                     descriptions.first ??
                     titles.first ??
                     "Item-\(childIndex)"
-                let displayTitle = directTitle ?? nestedTitles.first ?? directDescription
+                let displayTitle = titles.first ?? descriptions.first
                 let ownerPID = AXHelpers.pid(for: child) ?? runningApplication.processIdentifier
                 let isOnScreen = displayBounds.map { bounds in
                     bounds.intersects(frame)
@@ -262,6 +266,7 @@ struct MacOS27AccessibilityMenuBarItemProvider: MenuBarItemProviding {
                         namespace: namespace,
                         stableIdentity: stableIdentity,
                         displayTitle: displayTitle,
+                        publisherBundleIdentifier: publisherBundleIdentifier,
                         ownerPID: ownerPID,
                         sourcePID: sourcePID,
                         frame: frame,
@@ -379,6 +384,16 @@ struct MacOS27AccessibilityMenuBarItemProvider: MenuBarItemProviding {
             return lhs.stableIdentity < rhs.stableIdentity
         }
         var instanceCounts = [String: Int]()
+        let instanceTotals = Dictionary(grouping: ordered) { candidate in
+            "\(candidate.namespace)\u{1f}\(candidate.stableIdentity)"
+        }
+        .mapValues(\.count)
+        let ambiguousIdentityGroupCount = instanceTotals.values.count { $0 > 1 }
+        if ambiguousIdentityGroupCount > 0 {
+            logger.warning(
+                "AX enumeration found ambiguous identities; groups=\(ambiguousIdentityGroupCount, privacy: .public), physicalReorderingDisabled=true"
+            )
+        }
         var usedWindowIDs = Set<CGWindowID>()
 
         return ordered.map { candidate in
@@ -405,7 +420,15 @@ struct MacOS27AccessibilityMenuBarItemProvider: MenuBarItemProviding {
                 sourcePID: candidate.sourcePID,
                 bounds: candidate.frame,
                 title: candidate.displayTitle,
-                isOnScreen: candidate.isOnScreen
+                isOnScreen: candidate.isOnScreen,
+                accessibilityIdentity: MenuBarItem.AccessibilityIdentity(
+                    namespace: candidate.namespace,
+                    stableIdentity: candidate.stableIdentity,
+                    publisherBundleIdentifier: candidate.publisherBundleIdentifier,
+                    instanceIndex: instanceIndex,
+                    instanceCount: instanceTotals[groupKey] ?? 1,
+                    isMenuBarAgentPublisher: candidate.isMenuBarAgent
+                )
             )
         }
     }

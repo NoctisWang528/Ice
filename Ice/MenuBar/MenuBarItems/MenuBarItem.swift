@@ -8,6 +8,32 @@ import OSLog
 
 /// A structural representation of a menu bar item.
 struct MenuBarItem: CustomStringConvertible {
+    /// Stable identity information supplied by the Accessibility provider.
+    struct AccessibilityIdentity: Hashable, Sendable {
+        /// The normalized namespace used to identify the source application.
+        let namespace: String
+
+        /// The stable identity before any display-only instance suffix is added.
+        let stableIdentity: String
+
+        /// The bundle identifier of the application that published the AX item.
+        let publisherBundleIdentifier: String?
+
+        /// The item's index among entries with the same namespace and identity.
+        let instanceIndex: Int
+
+        /// The total number of entries with the same namespace and identity.
+        let instanceCount: Int
+
+        /// Whether the item was published through MenuBarAgent.
+        let isMenuBarAgentPublisher: Bool
+
+        /// Whether the identity can be resolved without guessing between duplicates.
+        var isAmbiguous: Bool {
+            instanceCount > 1
+        }
+    }
+
     /// A reference to the window associated with a menu bar item.
     enum WindowReference: Hashable {
         /// A real WindowServer window identifier.
@@ -80,6 +106,9 @@ struct MenuBarItem: CustomStringConvertible {
 
     /// A Boolean value that indicates whether the item is on screen.
     let isOnScreen: Bool
+
+    /// Stable identity metadata for Accessibility-backed items.
+    let accessibilityIdentity: AccessibilityIdentity?
 
     /// A Boolean value that indicates whether this item can be moved.
     var isMovable: Bool {
@@ -224,6 +253,7 @@ struct MenuBarItem: CustomStringConvertible {
         self.bounds = itemWindow.bounds
         self.title = itemWindow.title
         self.isOnScreen = itemWindow.isOnScreen
+        self.accessibilityIdentity = nil
     }
 
     /// Creates a menu bar item without checks.
@@ -240,6 +270,7 @@ struct MenuBarItem: CustomStringConvertible {
         self.bounds = itemWindow.bounds
         self.title = itemWindow.title
         self.isOnScreen = itemWindow.isOnScreen
+        self.accessibilityIdentity = nil
     }
 
     /// Creates an Accessibility-backed menu bar item.
@@ -250,7 +281,8 @@ struct MenuBarItem: CustomStringConvertible {
         sourcePID: pid_t?,
         bounds: CGRect,
         title: String?,
-        isOnScreen: Bool
+        isOnScreen: Bool,
+        accessibilityIdentity: AccessibilityIdentity
     ) {
         self.tag = tag
         self.windowReference = .synthetic(syntheticWindowID)
@@ -259,6 +291,7 @@ struct MenuBarItem: CustomStringConvertible {
         self.bounds = bounds
         self.title = title
         self.isOnScreen = isOnScreen
+        self.accessibilityIdentity = accessibilityIdentity
     }
 }
 
@@ -376,7 +409,8 @@ extension MenuBarItem: Equatable {
         lhs.sourcePID == rhs.sourcePID &&
         NSStringFromRect(lhs.bounds) == NSStringFromRect(rhs.bounds) &&
         lhs.title == rhs.title &&
-        lhs.isOnScreen == rhs.isOnScreen
+        lhs.isOnScreen == rhs.isOnScreen &&
+        lhs.accessibilityIdentity == rhs.accessibilityIdentity
     }
 }
 
@@ -390,6 +424,7 @@ extension MenuBarItem: Hashable {
         hasher.combine(NSStringFromRect(bounds))
         hasher.combine(title)
         hasher.combine(isOnScreen)
+        hasher.combine(accessibilityIdentity)
     }
 }
 
